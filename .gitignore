@@ -1,0 +1,11 @@
+﻿Obj/
+DebugConfig/
+Listings/
+*.uvguix.*
+*.crf
+*.o
+*.d
+*.htm
+*.lnp
+*.dep
+JLink*
