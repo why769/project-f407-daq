@@ -1,11 +1,16 @@
-﻿Obj/
-DebugConfig/
-Listings/
+﻿# Keil 构建产物
+f103/MDK-ARM/F103_WaterDAQ/
 *.uvguix.*
-*.crf
+*.hex
+*.lst
+*.map
+*.axf
 *.o
 *.d
-*.htm
+*.crf
 *.lnp
 *.dep
-JLink*
+*.htm
+# CubeMX 生成的大体积 CMSIS 库（可用 .ioc 重新生成）
+f103/Drivers/CMSIS/DSP/
+f103/Drivers/CMSIS/Lib/

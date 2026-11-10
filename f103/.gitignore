@@ -1,0 +1,13 @@
+﻿# Keil 构建产物
+MDK-ARM/F103_WaterDAQ/
+*.uvguix.*
+*.hex
+*.lst
+*.map
+*.axf
+*.o
+*.d
+*.crf
+*.lnp
+*.dep
+*.htm
