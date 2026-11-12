@@ -1,13 +1,19 @@
-﻿# Keil 构建产物
-MDK-ARM/F103_WaterDAQ/
+﻿# Keil 鏋勫缓浜х墿
+MDK-ARM/*/*.o
+MDK-ARM/*/*.d
+MDK-ARM/*/*.crf
+MDK-ARM/*/*.axf
+MDK-ARM/*/*.hex
+MDK-ARM/*/*.map
+MDK-ARM/*/*.htm
+MDK-ARM/*/*.lnp
+MDK-ARM/*/*.lst
+MDK-ARM/*/*.dep
+MDK-ARM/*/*.bak
+MDK-ARM/*/RTE/
 *.uvguix.*
-*.hex
+*.uvoptx.bak
 *.lst
-*.map
-*.axf
-*.o
-*.d
-*.crf
-*.lnp
-*.dep
-*.htm
+*.hex
+MDK-ARM/*.lst
+F103_WaterDAQ.ioc.bak
