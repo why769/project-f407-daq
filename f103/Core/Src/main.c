@@ -41,6 +41,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart1;
@@ -54,6 +56,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -171,7 +174,15 @@ static touch_state_t st_touch = ST_IDLE;   /* 当前状态 */
 static uint32_t t_press = 0;               /* 按下时刻 */
 static uint32_t g_short_cnt = 0;           /* 短按次数 */
 static uint32_t g_long_cnt  = 0;           /* 长按次数 */
+static uint8_t  g_page   = 0;           /* 0=信息页 1=计数页 */
+static uint8_t  g_dirty  = 1;           /* 1=需要重绘 */
+static uint32_t g_tds_mv = 0;            /* TDS 输出电压 mV */
+static uint32_t g_adc_raw = 0;           /* ADC 原始值 */
+static uint32_t g_tds_ppm = 0;            /* 换算出的 TDS 值 ppm */
+static uint8_t  g_pump = 0;                /* 水泵状态 0=关 1=开 */
 static void touch_fsm(void);
+static void oled_draw_page(void);
+static void tds_sample(void);
 
 /* USER CODE END 0 */
 
@@ -206,8 +217,11 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   /* ===== I2C 探测：OLED 地址 0x78 或 0x7A ===== */
+  /* 蜂鸣器实测为低电平触发：上电拉高，避免一直响 */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
   uint8_t g_oled_addr = 0;
   if (HAL_I2C_IsDeviceReady(&hi2c1, 0x78, 3, 100) == HAL_OK)      g_oled_addr = 1;
   else if (HAL_I2C_IsDeviceReady(&hi2c1, 0x7A, 3, 100) == HAL_OK) g_oled_addr = 2;
@@ -229,10 +243,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* 调试 OLED 期间暂停 touch_fsm，避免抢 LED；查完恢复 */
-    /* touch_fsm(); */
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-    HAL_Delay(1000);   /* 1s 心跳：程序在跑 */
+    touch_fsm();                                  /* 触摸状态机，5ms 一次 */
+    static uint32_t t_next = 0;
+    if (HAL_GetTick() >= t_next) { t_next = HAL_GetTick() + 500; tds_sample(); g_dirty = 1; }  /* 每 500ms 采一次 */
+    /* TDS 超过 500ppm 视为水质异常：蜂鸣器报警（低电平响） */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (g_tds_ppm >= 500) ? GPIO_PIN_RESET : GPIO_PIN_SET);   /* 低电平响 */
+    if (g_dirty) { g_dirty = 0; oled_draw_page(); }   /* 只有变化才重绘，省 I2C 带宽 */
+    HAL_Delay(5);
   }
   /* USER CODE END 3 */
 }
@@ -245,6 +262,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -274,6 +292,59 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -364,6 +435,12 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
+
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -371,10 +448,24 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PA1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PA2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA3 PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
@@ -470,7 +561,11 @@ static void touch_fsm(void)
       if (lv == 1) {
         if (now - t_press < 1000) {
           g_short_cnt++;
-          HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);   /* 短按：翻转 */
+          g_page ^= 1;              /* 短按：切换页面 */
+          g_pump ^= 1;              /* 短按：水泵开/关 */
+          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, g_pump ? GPIO_PIN_SET : GPIO_PIN_RESET);
+          g_dirty = 1;
+          HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
         }
         st_touch = ST_IDLE;
       } else if (now - t_press >= 1000) {
@@ -490,7 +585,48 @@ int fputc(int ch, FILE *f)
   HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
   return ch;
 }
-/* 说明：旧的 EXTI 回调已移除，按键事件统一由 touch_fsm 轮询处理 */
+
+/* mV → TDS(ppm)，厂家经验公式（按 5V 供电标定） */
+static uint32_t tds_mv_to_ppm(uint32_t mv)
+{
+  float v = (float)mv / 1000.0f;
+  float p = (133.42f * v * v * v - 255.86f * v * v + 857.39f * v) * 0.5f;
+  if (p < 0.0f) p = 0.0f;
+  if (p > 9999.0f) p = 9999.0f;
+  return (uint32_t)p;
+}
+/* 读一次 TDS 输出的 ADC 值，换算成 mV */
+static void tds_sample(void)
+{
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 20) == HAL_OK)
+  {
+    g_adc_raw = HAL_ADC_GetValue(&hadc1);
+    g_tds_mv  = (g_adc_raw * 3300UL) / 4096UL;   /* 12 位满量程 4096，参考 3.3V */
+    g_tds_ppm = tds_mv_to_ppm(g_tds_mv);
+  }
+  HAL_ADC_Stop(&hadc1);
+}
+static void oled_draw_page(void)
+{
+  char buf[20];
+  oled_fill(0x00);                 /* 清屏 */
+  if (g_page == 0)
+  {
+    oled_puts(1, 4,  "Group 25");
+    oled_puts(3, 4,  "OLED OK");
+    oled_puts(5, 4,  "F103C8T6");
+  }
+  else
+  {
+    oled_puts(1, 4,  "Water TDS:");
+    sprintf(buf, "%lu ppm", (unsigned long)g_tds_ppm);
+    oled_puts(3, 4, buf);
+    sprintf(buf, "%lu mV", (unsigned long)g_tds_mv);
+    oled_puts(5, 4, buf);
+    oled_puts(6, 4, g_pump ? "Pump:ON" : "Pump:OFF");
+  }
+}/* 说明：旧的 EXTI 回调已移除，按键事件统一由 touch_fsm 轮询处理 */
 /* USER CODE END 4 */
 
 /**
