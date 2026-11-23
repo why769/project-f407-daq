@@ -165,6 +165,7 @@ static void oled_puts(uint8_t page, uint8_t col, const char *s);
 /* ===== SSD1306 OLED 最小驱动 ===== */
 #define OLED_ADDR   0x78
 static void oled_cmd(uint8_t c);
+static void i2c_bus_recover(void);
 static void oled_dat(const uint8_t *buf, uint16_t len);
 static void oled_init(void);
 static void oled_fill(uint8_t val);
@@ -180,9 +181,28 @@ static uint32_t g_tds_mv = 0;            /* TDS 输出电压 mV */
 static uint32_t g_adc_raw = 0;           /* ADC 原始值 */
 static uint32_t g_tds_ppm = 0;            /* 换算出的 TDS 值 ppm */
 static uint8_t  g_pump = 0;                /* 水泵状态 0=关 1=开 */
+static uint8_t  g_i2c_err = 0;             /* I2C 连续失败次数 */
+static uint32_t g_pump_t0 = 0;               /* 水泵启动时刻，用于 3 秒自动关闭 */
+static uint8_t  g_last_lv = 1;               /* 上次采到的触摸电平 */
+static uint8_t  g_touch_stable = 0;         /* 同一电平连续采样次数（去抖） */
+static int16_t  g_temp_x10 = -999;          /* 温度 ×10（-999=未读到） */
+static uint8_t  g_ds_busy = 0;             /* 1=正在转换 */
+static uint32_t g_ds_t0 = 0;
 static void touch_fsm(void);
 static void oled_draw_page(void);
 static void tds_sample(void);
+/* ===== DS18B20 单总线驱动 ===== */
+static void dwt_init(void);
+static void delay_us(uint32_t us);
+static uint8_t ow_reset(void);
+static void ow_write_bit(uint8_t b);
+static uint8_t ow_read_bit(void);
+static void ow_write_byte(uint8_t v);
+static uint8_t ow_read_byte(void);
+
+static uint8_t ds_start(void);
+static int16_t ds_read(void);
+static int16_t ds18b20_read_raw(void);
 
 /* USER CODE END 0 */
 
@@ -222,6 +242,7 @@ int main(void)
   /* ===== I2C 探测：OLED 地址 0x78 或 0x7A ===== */
   /* 蜂鸣器实测为低电平触发：上电拉高，避免一直响 */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
+  dwt_init();                     /* DWT 周期计数器，用于微秒延时 */
   uint8_t g_oled_addr = 0;
   if (HAL_I2C_IsDeviceReady(&hi2c1, 0x78, 3, 100) == HAL_OK)      g_oled_addr = 1;
   else if (HAL_I2C_IsDeviceReady(&hi2c1, 0x7A, 3, 100) == HAL_OK) g_oled_addr = 2;
@@ -246,9 +267,31 @@ int main(void)
     touch_fsm();                                  /* 触摸状态机，5ms 一次 */
     static uint32_t t_next = 0;
     if (HAL_GetTick() >= t_next) { t_next = HAL_GetTick() + 500; tds_sample(); g_dirty = 1; }  /* 每 500ms 采一次 */
+    /* DS18B20 非阻塞：启动转换 → 等 760ms → 读取 */
+    if (!g_ds_busy) {
+      if (ds_start()) { g_ds_busy = 1; g_ds_t0 = HAL_GetTick(); }
+    } else if ((HAL_GetTick() - g_ds_t0) >= 760) {
+      int16_t raw = ds_read();
+      g_ds_busy = 0;
+      if (raw != -999) g_temp_x10 = (int16_t)((raw * 10) / 16);   /* raw*0.0625*10 */
+      g_dirty = 1;
+    }
+    /* 水泵自动关闭：运行满 3 秒 */
+    if (g_pump && (HAL_GetTick() - g_pump_t0 >= 3000)) {
+      g_pump = 0;
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+      g_dirty = 1;
+    }
     /* TDS 超过 500ppm 视为水质异常：蜂鸣器报警（低电平响） */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, (g_tds_ppm >= 500) ? GPIO_PIN_RESET : GPIO_PIN_SET);   /* 低电平响 */
     if (g_dirty) { g_dirty = 0; oled_draw_page(); }   /* 只有变化才重绘，省 I2C 带宽 */
+    /* I2C 看门狗：连续 3 次失败 → 恢复总线 + 重初始化屏 */
+    if (g_i2c_err >= 3) {
+      i2c_bus_recover();
+      oled_init();
+      g_dirty = 1;
+    }
     HAL_Delay(5);
   }
   /* USER CODE END 3 */
@@ -482,7 +525,7 @@ static void MX_GPIO_Init(void)
 static void oled_cmd(uint8_t c)
 {
   uint8_t buf[2] = { 0x00, c };           /* 0x00 = 命令 */
-  HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, buf, 2, 100);
+  if (HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, buf, 2, 100) != HAL_OK) { if (g_i2c_err < 255) g_i2c_err++; }
 }
 
 static void oled_dat(const uint8_t *buf, uint16_t len)
@@ -491,9 +534,37 @@ static void oled_dat(const uint8_t *buf, uint16_t len)
   if (len > 128) len = 128;
   tmp[0] = 0x40;                          /* 0x40 = 数据 */
   for (uint16_t i = 0; i < len; i++) tmp[1 + i] = buf[i];
-  HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, tmp, len + 1, 100);
+  if (HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, tmp, len + 1, 100) != HAL_OK) { if (g_i2c_err < 255) g_i2c_err++; }
 }
 
+/* I2C 总线恢复：从机把 SDA 拽住不放时，用 9 个 SCL 脉冲把它"踢"出来 */
+static void i2c_bus_recover(void)
+{
+  GPIO_InitTypeDef gi = {0};
+  uint8_t i;
+
+  HAL_I2C_DeInit(&hi2c1);                       /* 先释放 I2C 外设 */
+
+  gi.Pin   = GPIO_PIN_6 | GPIO_PIN_7;           /* PB6=SCL, PB7=SDA */
+  gi.Mode  = GPIO_MODE_OUTPUT_OD;
+  gi.Pull  = GPIO_PULLUP;
+  gi.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &gi);
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   /* 放开 SDA */
+  for (i = 0; i < 9; i++)                        /* 9 个时钟，逼从机吐完剩余位 */
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); delay_us(5);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   delay_us(5);
+  }
+  /* 手动产生 STOP：SCL 高时 SDA 由低变高 */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); delay_us(5);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   delay_us(5);
+
+  MX_I2C1_Init();                               /* 重新初始化 I2C */
+  g_i2c_err = 0;
+}
 static void oled_init(void)
 {
   HAL_Delay(100);
@@ -549,6 +620,13 @@ static void oled_fill(uint8_t val)
 static void touch_fsm(void)
 {
   uint32_t now = HAL_GetTick();
+  /* --- debounce: level must stay unchanged 3 samples (~15ms) --- */
+  {
+    uint8_t raw = (uint8_t)HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2);
+    if (raw == g_last_lv) { if (g_touch_stable < 250) g_touch_stable++; }
+    else { g_touch_stable = 0; g_last_lv = raw; }
+    if (g_touch_stable < 3) return;
+  }
   uint8_t  lv  = (uint8_t)HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2);  /* 0=按下 1=松开 */
 
   switch (st_touch)
@@ -561,16 +639,17 @@ static void touch_fsm(void)
       if (lv == 1) {
         if (now - t_press < 1000) {
           g_short_cnt++;
-          g_page ^= 1;              /* 短按：切换页面 */
-          g_pump ^= 1;              /* 短按：水泵开/关 */
-          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, g_pump ? GPIO_PIN_SET : GPIO_PIN_RESET);
+          g_page ^= 1;              /* short press: switch display page only */
           g_dirty = 1;
-          HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
         }
         st_touch = ST_IDLE;
       } else if (now - t_press >= 1000) {
         g_long_cnt++;
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);  /* 长按：强制关 */
+        g_pump    = 1;              /* long press: run pump, auto-stop after 3s */
+        g_pump_t0 = now;
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+        g_dirty = 1;
         st_touch = ST_LONG;
       }
       break;
@@ -607,6 +686,83 @@ static void tds_sample(void)
   }
   HAL_ADC_Stop(&hadc1);
 }
+/* ---------- DWT 微秒延时 ---------- */
+static void dwt_init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+static void delay_us(uint32_t us)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t ticks = us * (SystemCoreClock / 1000000U);
+  while ((DWT->CYCCNT - start) < ticks) { }
+}
+
+/* ---------- 单总线时序（PA1 开漏 + 上拉） ---------- */
+#define OW_LOW()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET)
+#define OW_REL()   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET)
+#define OW_IN()    HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1)
+
+static uint8_t ow_reset(void)
+{
+  uint8_t presence;
+  OW_LOW();  delay_us(480);      /* 复位脉冲 ≥480us */
+  OW_REL();  delay_us(70);       /* 等从机应答 */
+  presence = (OW_IN() == GPIO_PIN_RESET) ? 1 : 0;   /* 低 = 器件在 */
+  delay_us(410);
+  return presence;
+}
+
+static void ow_write_bit(uint8_t b)
+{
+  if (b) { OW_LOW(); delay_us(6);  OW_REL(); delay_us(64); }   /* 短低 = 1 */
+  else   { OW_LOW(); delay_us(60); OW_REL(); delay_us(10); }   /* 长低 = 0 */
+}
+
+static uint8_t ow_read_bit(void)
+{
+  uint8_t b;
+  OW_LOW(); delay_us(3);         /* 产生读时隙起点 */
+  OW_REL(); delay_us(10);        /* 让出总线，从机驱动 */
+  b = (OW_IN() == GPIO_PIN_SET) ? 1 : 0;
+  delay_us(53);
+  return b;
+}
+
+static void ow_write_byte(uint8_t v)
+{
+  for (uint8_t i = 0; i < 8; i++) { ow_write_bit(v & 0x01); v >>= 1; }
+}
+
+static uint8_t ow_read_byte(void)
+{
+  uint8_t v = 0;
+  for (uint8_t i = 0; i < 8; i++) { v >>= 1; if (ow_read_bit()) v |= 0x80; }
+  return v;
+}
+
+/* 读一次温度原始值（0.0625℃/LSB），失败返回 -999 */
+static uint8_t ds_start(void)
+{
+  if (!ow_reset()) return 0;
+  ow_write_byte(0xCC);
+  ow_write_byte(0x44);
+  return 1;
+}
+
+static int16_t ds_read(void)
+{
+  if (!ow_reset()) return -999;
+  ow_write_byte(0xCC);
+  ow_write_byte(0xBE);
+  return (int16_t)(((uint16_t)ow_read_byte() << 8) | ow_read_byte());
+}
+static int16_t ds18b20_read_raw(void)
+{ return ds_read(); }
+
 static void oled_draw_page(void)
 {
   char buf[20];
@@ -619,12 +775,17 @@ static void oled_draw_page(void)
   }
   else
   {
-    oled_puts(1, 4,  "Water TDS:");
-    sprintf(buf, "%lu ppm", (unsigned long)g_tds_ppm);
-    oled_puts(3, 4, buf);
-    sprintf(buf, "%lu mV", (unsigned long)g_tds_mv);
-    oled_puts(5, 4, buf);
-    oled_puts(6, 4, g_pump ? "Pump:ON" : "Pump:OFF");
+    oled_puts(0, 0, "Water Quality");
+    sprintf(buf, "TDS %lu ppm", (unsigned long)g_tds_ppm);
+    oled_puts(2, 0, buf);
+    if (g_temp_x10 == -999) { oled_puts(4, 0, "Temp --.-C"); }
+    else {
+      int16_t t10 = g_temp_x10 < 0 ? -g_temp_x10 : g_temp_x10;
+      sprintf(buf, "Temp %d.%dC", t10 / 10, t10 % 10);
+      oled_puts(4, 0, buf);
+    }
+    sprintf(buf, "%lu mV  %s", (unsigned long)g_tds_mv, g_pump ? "P:ON" : "P:OFF");
+    oled_puts(6, 0, buf);
   }
 }/* 说明：旧的 EXTI 回调已移除，按键事件统一由 touch_fsm 轮询处理 */
 /* USER CODE END 4 */
