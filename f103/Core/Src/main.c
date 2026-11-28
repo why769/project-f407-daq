@@ -164,6 +164,7 @@ static void oled_putchar(char c);
 static void oled_puts(uint8_t page, uint8_t col, const char *s);
 /* ===== SSD1306 OLED 最小驱动 ===== */
 #define OLED_ADDR   0x78
+static uint8_t g_oled_use_addr = 0x78;   /* 运行时可变：0x78 或 0x7A */
 static void oled_cmd(uint8_t c);
 static void i2c_bus_recover(void);
 static void oled_dat(const uint8_t *buf, uint16_t len);
@@ -191,6 +192,12 @@ static uint32_t g_ds_t0 = 0;
 static void touch_fsm(void);
 static void oled_draw_page(void);
 static void tds_sample(void);
+static void led_blink(uint8_t times, uint16_t on_ms, uint16_t off_ms);
+static void sw_i2c_init(void);
+static void sw_start(void);
+static void sw_stop(void);
+static uint8_t sw_write(uint8_t b);
+static uint8_t sw_probe(uint8_t addr);
 /* ===== DS18B20 单总线驱动 ===== */
 static void dwt_init(void);
 static void delay_us(uint32_t us);
@@ -244,17 +251,49 @@ int main(void)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
   dwt_init();                     /* DWT 周期计数器，用于微秒延时 */
   uint8_t g_oled_addr = 0;
-  if (HAL_I2C_IsDeviceReady(&hi2c1, 0x78, 3, 100) == HAL_OK)      g_oled_addr = 1;
-  else if (HAL_I2C_IsDeviceReady(&hi2c1, 0x7A, 3, 100) == HAL_OK) g_oled_addr = 2;
+  sw_i2c_init();                  /* 软件 I2C：SCL=PB7，SDA=PB6（按本板走线） */
+  if (sw_probe(0x78) == 0)      g_oled_addr = 1;
+  else if (sw_probe(0x7A) == 0) g_oled_addr = 2;
+  g_i2c_err = 0;
   if (g_oled_addr)
   {
+    led_blink(2, 250, 150);             /* 蓝灯慢闪 2 次 = 探测到屏 */
     oled_init();
-    oled_fill(0x00);                    /* 清屏 */
+    oled_fill(0xFF);                    /* 全屏点亮 800ms 自检 */
+    HAL_Delay(800);
+    oled_fill(0x00);
     oled_puts(1, 4, "Group 25");
     oled_puts(3, 4, "OLED OK");
     oled_puts(5, 4, "F103C8T6");
   }
+  else
+  {
+    led_blink(8, 80, 80);               /* 蓝灯快闪 8 次 = 没找到屏 */
+  }
 
+  /* ===== 屏幕点亮测试模式：上电即全屏黑白交替，验证屏与 I2C ===== */
+#define OLED_TEST_MODE  0
+#if OLED_TEST_MODE
+  led_blink(3, 100, 100);              /* 蓝灯闪 3 下：程序已跑起来 */
+  {
+    uint8_t try_addr[2] = { 0x78, 0x7A };
+    uint8_t k;
+    for (k = 0; k < 2; k++)
+    {
+      g_oled_use_addr = try_addr[k];
+      g_i2c_err = 0;
+      oled_init();                     /* 若该地址无器件，传输全部失败，屏无反应 */
+      oled_fill(0xFF);                 /* 全屏点亮 */
+      HAL_Delay(300);
+      if (g_i2c_err == 0) { break; }   /* 无失败 → 这个地址有器件 */
+    }
+  }
+  while (1)                          /* 停在测试循环：黑白交替 + 蓝灯同步闪 */
+  {
+    oled_fill(0xFF);  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  HAL_Delay(600);
+    oled_fill(0x00);  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);    HAL_Delay(600);
+  }
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -524,17 +563,22 @@ static void MX_GPIO_Init(void)
 /* ---------- SSD1306 驱动 ---------- */
 static void oled_cmd(uint8_t c)
 {
-  uint8_t buf[2] = { 0x00, c };           /* 0x00 = 命令 */
-  if (HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, buf, 2, 100) != HAL_OK) { if (g_i2c_err < 255) g_i2c_err++; }
+  sw_start();
+  if (sw_write(g_oled_use_addr)) { if (g_i2c_err < 255) g_i2c_err++; }
+  sw_write(0x00);                        /* 控制字节：命令 */
+  sw_write(c);
+  sw_stop();
 }
 
 static void oled_dat(const uint8_t *buf, uint16_t len)
 {
   uint8_t tmp[129];
   if (len > 128) len = 128;
-  tmp[0] = 0x40;                          /* 0x40 = 数据 */
-  for (uint16_t i = 0; i < len; i++) tmp[1 + i] = buf[i];
-  if (HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, tmp, len + 1, 100) != HAL_OK) { if (g_i2c_err < 255) g_i2c_err++; }
+  sw_start();
+  if (sw_write(g_oled_use_addr)) { if (g_i2c_err < 255) g_i2c_err++; }
+  sw_write(0x40);                        /* 控制字节：数据 */
+  for (uint16_t i = 0; i < len; i++) { sw_write(buf[i]); }
+  sw_stop();
 }
 
 /* I2C 总线恢复：从机把 SDA 拽住不放时，用 9 个 SCL 脉冲把它"踢"出来 */
@@ -617,6 +661,78 @@ static void oled_fill(uint8_t val)
   }
 }
 /* 触摸按键状态机：每 5ms 调用一次 */
+/* ================= 软件 I2C（按本板走线：SCL=PB7，SDA=PB6） =================
+   原因：底板把 OLED 的 SCL/SDA 接到了 PB7/PB6，与 STM32 硬件 I2C1
+        （PB6=SCL、PB7=SDA）相反，故改用软件模拟，引脚按板子来。 */
+#define I2C_SCL_H()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET)
+#define I2C_SCL_L()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET)
+#define I2C_SDA_H()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET)
+#define I2C_SDA_L()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET)
+#define I2C_SDA_R()   HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6)
+
+static void sw_i2c_init(void)
+{
+  GPIO_InitTypeDef g = {0};
+  g.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_PULLUP;
+  g.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &g);
+  I2C_SCL_H(); I2C_SDA_H();
+}
+
+static void sw_dly(void) { delay_us(3); }        /* 约 150 kHz */
+
+static void sw_start(void)
+{
+  I2C_SDA_H(); I2C_SCL_H(); sw_dly();
+  I2C_SDA_L(); sw_dly();
+  I2C_SCL_L(); sw_dly();
+}
+
+static void sw_stop(void)
+{
+  I2C_SDA_L(); sw_dly();
+  I2C_SCL_H(); sw_dly();
+  I2C_SDA_H(); sw_dly();
+}
+
+static uint8_t sw_write(uint8_t b)
+{
+  uint8_t i, nack;
+  for (i = 0; i < 8; i++)
+  {
+    if (b & 0x80) { I2C_SDA_H(); } else { I2C_SDA_L(); }
+    b <<= 1;
+    sw_dly(); I2C_SCL_H(); sw_dly(); I2C_SCL_L(); sw_dly();
+  }
+  I2C_SDA_H(); sw_dly();                 /* 释放 SDA，等从机应答 */
+  I2C_SCL_H(); sw_dly();
+  nack = (I2C_SDA_R() == GPIO_PIN_RESET) ? 0 : 1;   /* 0=有应答 */
+  I2C_SCL_L(); sw_dly();
+  return nack;
+}
+
+static uint8_t sw_probe(uint8_t addr)
+{
+  uint8_t nack;
+  sw_start();
+  nack = sw_write(addr);
+  sw_stop();
+  return nack;                            /* 0 = 器件存在 */
+}
+/* LED 闪烁提示：PC13 低电平点亮 */
+static void led_blink(uint8_t times, uint16_t on_ms, uint16_t off_ms)
+{
+  uint8_t i;
+  for (i = 0; i < times; i++)
+  {
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    HAL_Delay(on_ms);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_Delay(off_ms);
+  }
+}
 static void touch_fsm(void)
 {
   uint32_t now = HAL_GetTick();
